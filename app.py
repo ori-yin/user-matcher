@@ -10,6 +10,7 @@ import re
 import time
 import os
 from collections import Counter
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # ============ 配置 ============
 BASE_URL = "https://qianfan.baidubce.com/v2/coding"
@@ -215,8 +216,8 @@ def _build_report(total, all_results, all_tags_counter, cancel_flag, df=None, ti
     return report
 
 
-def process_excel(file, sheet_name, title_col_idx, api_key, base_url, model, batch_size, test_mode=False, progress=gr.Progress()):
-    """处理Excel文件。test_mode=True 时只处理前 TEST_COUNT 条。"""
+def process_excel(file, sheet_name, title_col_idx, api_key, base_url, model, batch_size, concurrency=3, test_mode=False, progress=gr.Progress()):
+    """处理Excel文件。支持并行处理加速。test_mode=True 时只处理前 TEST_COUNT 条。"""
     global cancel_flag
     cancel_flag = False
 
@@ -247,35 +248,68 @@ def process_excel(file, sheet_name, title_col_idx, api_key, base_url, model, bat
 
     # 分批处理
     batch_size = int(batch_size)
-    all_results = []
-    all_tags_counter = Counter()
-
-    progress(0, desc="开始分析..." if not test_mode else f"快速测试：分析前{TEST_COUNT}条...")
-
+    concurrency = int(concurrency)
+    batches = []
     for batch_idx in range(0, total, batch_size):
-        if cancel_flag:
-            remaining = total - len(all_results)
-            all_results.extend([{"bool": 0, "score": 0.0, "tags": ["已取消"], "reason": "用户取消"}] * remaining)
-            break
-
         batch_titles = titles[batch_idx:batch_idx + batch_size]
-        batch_num = batch_idx // batch_size + 1
-        total_batches = (total + batch_size - 1) // batch_size
+        batches.append((batch_idx // batch_size, batch_titles))
 
-        progress(batch_idx / total, desc=f"处理第 {batch_num}/{total_batches} 批...（已处理 {len(all_results)}/{total}）")
+    total_batches = len(batches)
+    completed_batches = 0
+    batch_results_map = {}  # {batch_num: results}
 
+    progress(0, desc=f"开始{'测试' if test_mode else '分析'}... 共{total_batches}批，并发{concurrency}")
+
+    def process_single_batch(batch_info):
+        """处理单个批次（在线程中执行）"""
+        batch_num, batch_titles = batch_info
         try:
-            batch_results = analyze_batch(batch_titles, client, model)
-            for item in batch_results:
+            results = analyze_batch(batch_titles, client, model)
+            processed = []
+            for item in results:
                 tags = item.get("tags", [])
                 reason = item.get("reason", "")
                 score = calculate_score(tags)
                 bool_val = 1 if score >= THRESHOLD else 0
-                all_results.append({"bool": bool_val, "score": round(score, 2), "tags": tags, "reason": reason})
-                all_tags_counter.update(tags)
+                processed.append({"bool": bool_val, "score": round(score, 2), "tags": tags, "reason": reason})
+            return batch_num, processed, None
         except Exception as e:
-            all_results.extend([{"bool": 0, "score": 0.0, "tags": ["分析失败"], "reason": str(e)[:200]}] * len(batch_titles))
-            print(f"第 {batch_num} 批处理失败: {e}")
+            error_result = [{"bool": 0, "score": 0.0, "tags": ["分析失败"], "reason": str(e)[:200]}] * len(batch_titles)
+            return batch_num, error_result, str(e)
+
+    # 并行处理
+    with ThreadPoolExecutor(max_workers=concurrency) as executor:
+        futures = {executor.submit(process_single_batch, batch): batch[0] for batch in batches}
+
+        for future in as_completed(futures):
+            if cancel_flag:
+                # 取消时停止提交新任务
+                for f in futures:
+                    f.cancel()
+                break
+
+            batch_num, results, error = future.result()
+            batch_results_map[batch_num] = results
+            completed_batches += 1
+
+            if error:
+                print(f"第 {batch_num + 1} 批处理失败: {error}")
+
+            progress(completed_batches / total_batches, desc=f"已完成 {completed_batches}/{total_batches} 批...")
+
+    # 按批次顺序组装结果
+    all_results = []
+    all_tags_counter = Counter()
+    for i in range(total_batches):
+        if i in batch_results_map:
+            for item in batch_results_map[i]:
+                all_results.append(item)
+                all_tags_counter.update(item.get("tags", []))
+
+    # 取消时填充剩余
+    if cancel_flag:
+        remaining = total - len(all_results)
+        all_results.extend([{"bool": 0, "score": 0.0, "tags": ["已取消"], "reason": "用户取消"}] * remaining)
 
     # 确保结果数量匹配
     all_results.extend([{"bool": 0, "score": 0.0, "tags": ["未处理"], "reason": ""}] * (total - len(all_results)))
@@ -337,6 +371,14 @@ with gr.Blocks(title="Push文案用户匹配分析", theme=gr.themes.Soft()) as 
                     step=10,
                     info="建议50-100，过大可能超出token限制"
                 )
+                concurrency = gr.Slider(
+                    label="并行批次数",
+                    minimum=1,
+                    maximum=10,
+                    value=3,
+                    step=1,
+                    info="同时处理的批次数，越大越快但API压力越大"
+                )
 
             with gr.Row():
                 submit_btn = gr.Button("🚀 开始分析", variant="primary", size="lg")
@@ -391,7 +433,8 @@ with gr.Blocks(title="Push文案用户匹配分析", theme=gr.themes.Soft()) as 
 
                     **注意事项：**
                     - 每批处理条数建议50-100
-                    - 处理时间取决于总条数和API响应速度
+                    - 并行批次数建议3-5，API压力大时调低
+                    - 并行处理可大幅缩短时间（3并发≈3倍速）
                     - 如遇限流会自动重试
                     - 可随时点击"取消"按钮停止
                     """)
@@ -408,13 +451,13 @@ with gr.Blocks(title="Push文案用户匹配分析", theme=gr.themes.Soft()) as 
 
     submit_btn.click(
         fn=process_excel,
-        inputs=[file_input, sheet_dropdown, title_col_idx, api_key, base_url, model, batch_size],
+        inputs=[file_input, sheet_dropdown, title_col_idx, api_key, base_url, model, batch_size, concurrency],
         outputs=[output_file, output_report]
     )
 
     test_btn.click(
         fn=lambda *args: process_excel(*args, test_mode=True),
-        inputs=[file_input, sheet_dropdown, title_col_idx, api_key, base_url, model, batch_size],
+        inputs=[file_input, sheet_dropdown, title_col_idx, api_key, base_url, model, batch_size, concurrency],
         outputs=[output_file, output_report]
     )
 
