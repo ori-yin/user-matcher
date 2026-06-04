@@ -91,20 +91,48 @@ def call_llm_with_retry(client, model, messages, max_tokens=4000, max_retries=5)
 
 
 def extract_json_from_text(text):
-    """从文本中提取JSON数组，兼容模型返回额外内容的情况"""
-    candidates = [text]
+    """从文本中提取JSON数组，兼容模型返回额外内容和截断的情况"""
+    candidates = []
+
+    # 1. 完整的 ```json ... ``` 代码块
     code_block = re.search(r"```(?:json)?\s*(\[.*?\])\s*```", text, re.DOTALL)
     if code_block:
         candidates.append(code_block.group(1))
+
+    # 2. 被截断的代码块（没有闭合 ```）
+    truncated_block = re.search(r"```(?:json)?\s*(\[.*)", text, re.DOTALL)
+    if truncated_block:
+        candidates.append(truncated_block.group(1))
+
+    # 3. 完整的 JSON 数组
     array_match = re.search(r"\[.*\]", text, re.DOTALL)
     if array_match:
         candidates.append(array_match.group(0))
 
+    # 4. 原始文本
+    candidates.append(text)
+
     for candidate in candidates:
+        # 清理可能的尾部噪音
+        candidate = candidate.strip()
         try:
             return json.loads(candidate)
         except json.JSONDecodeError:
+            pass
+
+        # 尝试抢救被截断的JSON：找到最后一个完整对象，截断并闭合数组
+        try:
+            # 找到最后一个完整的 } 位置
+            last_brace = candidate.rfind('}')
+            if last_brace > 0:
+                truncated = candidate[:last_brace + 1]
+                # 确保以 ] 结尾
+                if not truncated.rstrip().endswith(']'):
+                    truncated = truncated.rstrip() + ']'
+                return json.loads(truncated)
+        except json.JSONDecodeError:
             continue
+
     return None
 
 
